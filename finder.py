@@ -337,7 +337,8 @@ def get_walmart_stores() -> list:
     ]
 
 
-def check_walmart_store(store: dict) -> bool:
+def check_walmart_store(store: dict):
+    """Return True if in stock, 'oos' if stocked but out of stock, False if not found."""
     url = f"https://www.walmart.com/search?q={quote_plus(PRODUCT)}&stores={store['id']}"
     r = SESSION.get(url, timeout=15, headers={"Referer": "https://www.walmart.com/"})
 
@@ -359,19 +360,18 @@ def check_walmart_store(store: dict) -> bool:
                 for item in stack.get("items", []):
                     if contains_product(item.get("name", "")):
                         avail = (item.get("availabilityStatusV2", {})
-                                     .get("display", ""))
-                        if avail.lower() not in ("out of stock", "unavailable"):
+                                     .get("display", "")).lower()
+                        if avail not in ("out of stock", "unavailable"):
                             return True
+                        return "oos"
             if likely_in_stock(page_str):
                 return True
-            log(f"    Product found but out of stock")
-            return False
+            return "oos"
 
     if contains_product(r.text):
         if likely_in_stock(r.text):
             return True
-        log(f"    Product found in HTML but out of stock")
-        return False
+        return "oos"
 
     log(f"    Not found in search results")
     return False
@@ -381,16 +381,31 @@ def check_walmart() -> list:
     warmup("https://www.walmart.com/")
     stores = get_walmart_stores()
     found = []
+    oos = []   # stores that have the product but it's out of stock
     for s in stores:
         dist = s.get("distance") or haversine(HOME_LAT, HOME_LON, s["lat"], s["lon"])
         log(f"  Checking {s['name']} ({dist:.1f} mi)…")
         try:
-            if check_walmart_store(s):
+            result = check_walmart_store(s)
+            if result is True:
                 log(f"  *** FOUND at {s['name']}! ***")
                 found.append({**s, "distance": dist, "source": "Walmart"})
+            elif result == "oos":
+                log(f"    Stocked but out of stock right now")
+                oos.append({**s, "distance": dist})
         except Exception as e:
             log(f"  Error: {e}")
         time.sleep(2)
+
+    # If none in stock but some stores carry it, send a low-priority heads-up
+    if oos and not found:
+        oos_names = ", ".join(s["name"] for s in oos)
+        log(f"  Walmart carries it but OOS at: {oos_names}")
+        notify(
+            "Busch Light Apple — Out of Stock at Walmart",
+            f"Product is stocked at {len(oos)} Walmart(s) near you but currently sold out.\n"
+            f"Stores: {oos_names}\n\nKeep checking — it will restock!",
+        )
     return found
 
 
@@ -437,65 +452,93 @@ def check_bevmo() -> list:
 # Busch Light official "Where to Buy" locator (powered by Locally.com)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_locally_company_id() -> str:
-    """Scrape the Busch Light site to find their Locally.com company ID."""
-    try:
-        r = SESSION.get("https://www.buschlight.com/", timeout=15)
-        m = re.search(r'company[_-]?id["\s:=\']+(\d+)', r.text, re.I)
-        if m:
-            return m.group(1)
-        m = re.search(r'locally\.com[^"\']*company_id=(\d+)', r.text, re.I)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    # Anheuser-Busch's known Locally.com company ID
-    return "14"
+def _locally_fetch(company_id: str) -> list:
+    """Try all known Locally.com endpoint patterns and return stores list."""
+    api_headers = {
+        "Referer": "https://www.buschlight.com/",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    endpoints = [
+        # Most common Locally.com format
+        (f"https://www.locally.com/stores/map_data"
+         f"?company_id={company_id}&locale={HOME_ZIP}&radius={RADIUS_MILES}&no_variants=0"),
+        # GeoJSON variant
+        (f"https://www.locally.com/stores/geo_json"
+         f"?company_id={company_id}&locale={HOME_ZIP}&radius={RADIUS_MILES}"),
+        # With UPC for Busch Light Apple 12pk (common barcode)
+        (f"https://www.locally.com/stores/map_data"
+         f"?company_id={company_id}&locale={HOME_ZIP}&radius={RADIUS_MILES}"
+         f"&upc=018200013753&no_variants=0"),
+        # Some brands use product_id instead
+        (f"https://www.locally.com/stores/map_data"
+         f"?company_id={company_id}&locale={HOME_ZIP}&radius={RADIUS_MILES}"
+         f"&q={quote_plus(PRODUCT)}&no_variants=0"),
+    ]
+    for url in endpoints:
+        try:
+            r = SESSION.get(url, timeout=12, headers=api_headers)
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("stores", data.get("results", data.get("features", [])))
+            log(f"  Locally endpoint HTTP {r.status_code}: {url.split('?')[0].split('/')[-1]}")
+        except Exception:
+            continue
+    return []
 
 
 def check_buschlight_locator() -> list:
     """
     Query the Busch Light official store locator.
-    Their site embeds a Locally.com widget; we call that API directly.
-    This is the most accurate source because it's the brand's own data.
+    AB InBev embeds a Locally.com widget on buschlight.com; we call it directly.
     """
     found = []
     try:
-        company_id = _get_locally_company_id()
-        url = (
-            "https://www.locally.com/stores/map_data"
-            f"?company_id={company_id}"
-            f"&locale={HOME_ZIP}"
-            f"&radius={RADIUS_MILES}"
-            f"&q={quote_plus(PRODUCT)}"
-            "&no_variants=0"
-        )
-        r = SESSION.get(url, timeout=15, headers={
-            "Referer": "https://www.buschlight.com/",
-            "Accept": "application/json, text/javascript, */*",
-        })
+        # Try to extract company_id from buschlight.com page
+        company_id = "14"
+        try:
+            r = SESSION.get("https://www.buschlight.com/", timeout=12)
+            for pat in [
+                r'company[_-]?id["\s:=\']+(\d+)',
+                r'locally[^"\']*company_id=(\d+)',
+                r'"companyId"\s*:\s*"?(\d+)',
+                r'data-company-id=["\'](\d+)',
+            ]:
+                m = re.search(pat, r.text, re.I)
+                if m:
+                    company_id = m.group(1)
+                    log(f"  Found Locally company_id: {company_id}")
+                    break
+        except Exception:
+            pass
 
-        if r.status_code != 200:
-            log(f"  Busch Light locator returned HTTP {r.status_code}")
-            return found
+        stores = _locally_fetch(company_id)
 
-        data = r.json()
-        stores = data.get("stores", data.get("results", []))
+        # If default ID fails, try a few known AB InBev IDs
+        if not stores and company_id == "14":
+            for alt_id in ["1", "2", "100", "101", "500"]:
+                stores = _locally_fetch(alt_id)
+                if stores:
+                    log(f"  Working company_id: {alt_id}")
+                    break
+
         for s in stores:
-            lat = s.get("lat") or s.get("latitude")
-            lon = s.get("lng") or s.get("longitude") or s.get("lon")
+            # GeoJSON features have different structure
+            props = s.get("properties", s)
+            lat = props.get("lat") or props.get("latitude") or (s.get("geometry", {}).get("coordinates", [None, None])[1])
+            lon = props.get("lng") or props.get("longitude") or props.get("lon") or (s.get("geometry", {}).get("coordinates", [None, None])[0])
             if not (lat and lon):
                 continue
             dist = haversine(HOME_LAT, HOME_LON, float(lat), float(lon))
             if dist > RADIUS_MILES:
                 continue
-            city  = s.get("city", "")
-            state = s.get("state", "")
-            zipcd = s.get("zip", "")
-            addr  = f"{s.get('address', '')}, {city}, {state} {zipcd}".strip(", ")
-            log(f"  *** FOUND at {s.get('name', 'Store')} ({dist:.1f} mi) ***")
+            city  = props.get("city", "")
+            state = props.get("state", "")
+            zipcd = props.get("zip", "")
+            addr  = f"{props.get('address', '')}, {city}, {state} {zipcd}".strip(", ")
+            log(f"  *** FOUND at {props.get('name', 'Store')} ({dist:.1f} mi) ***")
             found.append({
-                "name": s.get("name", "Unknown Store"),
+                "name": props.get("name", "Unknown Store"),
                 "address": addr,
                 "lat": float(lat), "lon": float(lon),
                 "distance": dist, "source": "Busch Light Locator",
@@ -505,6 +548,62 @@ def check_buschlight_locator() -> list:
             log("  Not found via Busch Light locator")
     except Exception as e:
         log(f"  Busch Light locator error: {e}")
+    return found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BeerMenus scraper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_beermenus() -> list:
+    """
+    Check BeerMenus.com — a dedicated beer tracking site for bars/stores.
+    Less aggressively bot-protected than big retail sites.
+    """
+    found = []
+    try:
+        url = (
+            f"https://www.beermenus.com/search?q={quote_plus(PRODUCT)}"
+            f"&lat={HOME_LAT}&lng={HOME_LON}"
+        )
+        r = SESSION.get(url, timeout=15, headers={"Referer": "https://www.beermenus.com/"})
+
+        if r.status_code != 200:
+            log(f"  BeerMenus returned HTTP {r.status_code}")
+            return found
+
+        soup = BeautifulSoup(r.text, "lxml")
+
+        for place in soup.select(".place-list-item, .js-place-list-item, [data-place-id], .search-result"):
+            name_el = place.select_one("h3, h4, .name, .place-name")
+            addr_el = place.select_one(".address, .place-address, .location")
+            dist_el = place.select_one(".distance, [data-distance]")
+
+            name = name_el.get_text(strip=True) if name_el else None
+            if not name or not contains_product(r.text):
+                continue
+
+            dist_text = dist_el.get_text(strip=True) if dist_el else ""
+            dist_m = re.search(r"([\d.]+)\s*mi", dist_text)
+            if dist_m:
+                dist = float(dist_m.group(1))
+            else:
+                dist = RADIUS_MILES  # assume in range if no distance shown
+
+            if dist <= RADIUS_MILES:
+                addr = addr_el.get_text(strip=True) if addr_el else "See beermenus.com"
+                log(f"  *** FOUND at {name} ({dist:.1f} mi) ***")
+                found.append({
+                    "name": name,
+                    "address": addr,
+                    "lat": HOME_LAT, "lon": HOME_LON,
+                    "distance": dist, "source": "BeerMenus",
+                })
+
+        if not found:
+            log("  BeerMenus: not found nearby")
+    except Exception as e:
+        log(f"  BeerMenus error: {e}")
     return found
 
 
@@ -593,6 +692,9 @@ def run_check() -> list:
 
     log("▶ BevMo")
     all_found += check_bevmo()
+
+    log("▶ BeerMenus")
+    all_found += check_beermenus()
 
     log("▶ Local Stores (Safeway, Walgreens, Circle K)")
     all_found += check_local_stores()
