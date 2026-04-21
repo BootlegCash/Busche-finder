@@ -400,9 +400,9 @@ def check_walmart() -> list:
 
 _BEVMO_STORES = [
     {
-        "name": "BevMo! – Tucson (Calle Santa Cruz)",
-        "address": "5425 S Calle Santa Cruz, Tucson AZ 85706",
-        "lat": 32.1578, "lon": -110.9653,
+        "name": "BevMo! – Tucson Broadway",
+        "address": "6228 E Broadway Blvd, Tucson AZ 85711",
+        "lat": 32.2185, "lon": -110.8556,
     },
 ]
 
@@ -433,6 +433,146 @@ def check_bevmo() -> list:
     return found
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Busch Light official "Where to Buy" locator (powered by Locally.com)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_locally_company_id() -> str:
+    """Scrape the Busch Light site to find their Locally.com company ID."""
+    try:
+        r = SESSION.get("https://www.buschlight.com/", timeout=15)
+        m = re.search(r'company[_-]?id["\s:=\']+(\d+)', r.text, re.I)
+        if m:
+            return m.group(1)
+        m = re.search(r'locally\.com[^"\']*company_id=(\d+)', r.text, re.I)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    # Anheuser-Busch's known Locally.com company ID
+    return "14"
+
+
+def check_buschlight_locator() -> list:
+    """
+    Query the Busch Light official store locator.
+    Their site embeds a Locally.com widget; we call that API directly.
+    This is the most accurate source because it's the brand's own data.
+    """
+    found = []
+    try:
+        company_id = _get_locally_company_id()
+        url = (
+            "https://www.locally.com/stores/map_data"
+            f"?company_id={company_id}"
+            f"&locale={HOME_ZIP}"
+            f"&radius={RADIUS_MILES}"
+            f"&q={quote_plus(PRODUCT)}"
+            "&no_variants=0"
+        )
+        r = SESSION.get(url, timeout=15, headers={
+            "Referer": "https://www.buschlight.com/",
+            "Accept": "application/json, text/javascript, */*",
+        })
+
+        if r.status_code != 200:
+            log(f"  Busch Light locator returned HTTP {r.status_code}")
+            return found
+
+        data = r.json()
+        stores = data.get("stores", data.get("results", []))
+        for s in stores:
+            lat = s.get("lat") or s.get("latitude")
+            lon = s.get("lng") or s.get("longitude") or s.get("lon")
+            if not (lat and lon):
+                continue
+            dist = haversine(HOME_LAT, HOME_LON, float(lat), float(lon))
+            if dist > RADIUS_MILES:
+                continue
+            city  = s.get("city", "")
+            state = s.get("state", "")
+            zipcd = s.get("zip", "")
+            addr  = f"{s.get('address', '')}, {city}, {state} {zipcd}".strip(", ")
+            log(f"  *** FOUND at {s.get('name', 'Store')} ({dist:.1f} mi) ***")
+            found.append({
+                "name": s.get("name", "Unknown Store"),
+                "address": addr,
+                "lat": float(lat), "lon": float(lon),
+                "distance": dist, "source": "Busch Light Locator",
+            })
+
+        if not found:
+            log("  Not found via Busch Light locator")
+    except Exception as e:
+        log(f"  Busch Light locator error: {e}")
+    return found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local Tucson liquor stores
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LOCAL_STORES = [
+    # Safeway — sells Busch products, very close to home
+    {
+        "name": "Safeway – 22nd St",
+        "address": "6230 E 22nd St, Tucson AZ 85711",
+        "lat": 32.2052, "lon": -110.8554,
+        "search_url": "https://www.safeway.com/shop/search-results.html?q=busch+light+apple",
+        "referer": "https://www.safeway.com/",
+    },
+    # Walgreens — sells beer/wine in AZ
+    {
+        "name": "Walgreens – Broadway",
+        "address": "5885 E Broadway Blvd, Tucson AZ 85711",
+        "lat": 32.2190, "lon": -110.8700,
+        "search_url": "https://www.walgreens.com/search/results.jsp?Ntt=busch+light+apple",
+        "referer": "https://www.walgreens.com/",
+    },
+    # Circle K — sells beer in AZ, multiple nearby
+    {
+        "name": "Circle K – Wilmot/Broadway",
+        "address": "6101 E Broadway Blvd, Tucson AZ 85711",
+        "lat": 32.2189, "lon": -110.8627,
+        "search_url": None,  # no search page; availability checked by brand locator
+        "referer": None,
+    },
+]
+
+
+def check_local_store(s: dict) -> bool:
+    """Check a local store's website for the product."""
+    if not s.get("search_url"):
+        return False
+    try:
+        r = SESSION.get(
+            s["search_url"], timeout=15,
+            headers={"Referer": s.get("referer", "")},
+        )
+        if r.status_code != 200:
+            log(f"    HTTP {r.status_code}")
+            return False
+        if contains_product(r.text) and likely_in_stock(r.text):
+            return True
+        log(f"    Not found in search results")
+    except Exception as e:
+        log(f"    Error: {e}")
+    return False
+
+
+def check_local_stores() -> list:
+    found = []
+    for s in _LOCAL_STORES:
+        dist = haversine(HOME_LAT, HOME_LON, s["lat"], s["lon"])
+        if dist > RADIUS_MILES:
+            continue
+        log(f"  Checking {s['name']} ({dist:.1f} mi)…")
+        if check_local_store(s):
+            log(f"  *** FOUND at {s['name']}! ***")
+            found.append({**s, "distance": dist, "source": "Local Store"})
+        time.sleep(1.5)
+    return found
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main loop
@@ -442,6 +582,9 @@ def run_check() -> list:
     log(f"Checking for '{PRODUCT}' within {RADIUS_MILES} miles…")
     all_found = []
 
+    log("▶ Busch Light Official Locator")
+    all_found += check_buschlight_locator()
+
     log("▶ Total Wine")
     all_found += check_totalwine()
 
@@ -450,6 +593,9 @@ def run_check() -> list:
 
     log("▶ BevMo")
     all_found += check_bevmo()
+
+    log("▶ Local Stores (Safeway, Walgreens, Circle K)")
+    all_found += check_local_stores()
 
     if all_found:
         lines = "\n\n".join(
@@ -484,7 +630,7 @@ def main() -> None:
 ╔══════════════════════════════════════════════════════════╗
 ║            Busch Light Apple Finder                      ║
 ║  Searching: {RADIUS_MILES} miles from 4432 E El Sol Cir, Tucson AZ  ║
-║  Stores:    Total Wine · Walmart · BevMo                 ║
+║  Stores:    Busch Locator·Total Wine·Walmart·BevMo·Local ║
 ║  Notify:    https://ntfy.sh/{NTFY_TOPIC:<28}║
 ╚══════════════════════════════════════════════════════════╝
 To receive alerts on your phone:
