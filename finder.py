@@ -50,13 +50,31 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+    "Cache-Control": "max-age=0",
+    "Connection": "keep-alive",
 }
 
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
+
+def warmup(base_url: str) -> None:
+    """Visit a site's homepage to pick up session cookies before scraping."""
+    try:
+        SESSION.get(base_url, timeout=10)
+        time.sleep(1)
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
@@ -201,23 +219,35 @@ def check_totalwine_store(store: dict) -> bool:
         f"&storeId={store['id']}"
         "&limitFrom=0&limitTo=24"
     )
-    r = SESSION.get(url, timeout=15)
+    r = SESSION.get(url, timeout=15, headers={"Referer": "https://www.totalwine.com/"})
+
+    if r.status_code != 200:
+        log(f"    Total Wine returned HTTP {r.status_code} — skipping")
+        return False
 
     # Prefer structured Next.js data
     nd = parse_nextjs_json(r.text)
     if nd:
         page_str = json.dumps(nd)
-        if contains_product(page_str) and likely_in_stock(page_str):
-            return True
+        if contains_product(page_str):
+            if likely_in_stock(page_str):
+                return True
+            log(f"    Product found but marked out of stock")
+            return False
 
     # Fallback: raw HTML
-    if contains_product(r.text) and likely_in_stock(r.text):
-        return True
+    if contains_product(r.text):
+        if likely_in_stock(r.text):
+            return True
+        log(f"    Product found in HTML but marked out of stock")
+        return False
 
+    log(f"    Not found in search results")
     return False
 
 
 def check_totalwine() -> list:
+    warmup("https://www.totalwine.com/")
     stores = get_totalwine_stores()
     found = []
     for s in stores:
@@ -309,14 +339,17 @@ def get_walmart_stores() -> list:
 
 def check_walmart_store(store: dict) -> bool:
     url = f"https://www.walmart.com/search?q={quote_plus(PRODUCT)}&stores={store['id']}"
-    r = SESSION.get(url, timeout=15)
+    r = SESSION.get(url, timeout=15, headers={"Referer": "https://www.walmart.com/"})
+
+    if r.status_code != 200:
+        log(f"    Walmart returned HTTP {r.status_code} — skipping")
+        return False
 
     # Parse Next.js structured data first
     nd = parse_nextjs_json(r.text)
     if nd:
         page_str = json.dumps(nd)
         if contains_product(page_str):
-            # Walk item stacks for explicit availability
             stacks = (nd.get("props", {})
                         .get("pageProps", {})
                         .get("initialData", {})
@@ -329,18 +362,23 @@ def check_walmart_store(store: dict) -> bool:
                                      .get("display", ""))
                         if avail.lower() not in ("out of stock", "unavailable"):
                             return True
-            # If no explicit availability data but product is mentioned
             if likely_in_stock(page_str):
                 return True
+            log(f"    Product found but out of stock")
+            return False
 
-    # Fallback: raw HTML
-    if contains_product(r.text) and likely_in_stock(r.text):
-        return True
+    if contains_product(r.text):
+        if likely_in_stock(r.text):
+            return True
+        log(f"    Product found in HTML but out of stock")
+        return False
 
+    log(f"    Not found in search results")
     return False
 
 
 def check_walmart() -> list:
+    warmup("https://www.walmart.com/")
     stores = get_walmart_stores()
     found = []
     for s in stores:
@@ -372,9 +410,14 @@ _BEVMO_STORES = [
 def check_bevmo() -> list:
     """Check BevMo site-wide search; flag any nearby stores if product appears."""
     found = []
+    warmup("https://www.bevmo.com/")
     try:
         url = f"https://www.bevmo.com/search?q={quote_plus(PRODUCT)}"
-        r = SESSION.get(url, timeout=15)
+        r = SESSION.get(url, timeout=15, headers={"Referer": "https://www.bevmo.com/"})
+
+        if r.status_code != 200:
+            log(f"  BevMo returned HTTP {r.status_code}")
+            return found
 
         if not contains_product(r.text):
             log("  BevMo: not found site-wide")
@@ -383,7 +426,7 @@ def check_bevmo() -> list:
         for s in _BEVMO_STORES:
             dist = haversine(HOME_LAT, HOME_LON, s["lat"], s["lon"])
             if dist <= RADIUS_MILES:
-                log(f"  *** FOUND at {s['name']} ({dist:.1f} mi) — verify in-stock ***")
+                log(f"  *** FOUND at {s['name']} ({dist:.1f} mi) ***")
                 found.append({**s, "distance": dist, "source": "BevMo"})
     except Exception as e:
         log(f"  BevMo error: {e}")
