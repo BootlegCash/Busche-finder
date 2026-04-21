@@ -102,20 +102,22 @@ def maps_link(address: str) -> str:
 def notify(title: str, body: str, click_url: str = "") -> None:
     """Send a push notification via ntfy.sh — completely free, no account needed."""
     try:
+        # HTTP headers must be ASCII — strip/replace any non-ASCII characters
+        safe_title = title.encode("ascii", errors="replace").decode("ascii")
         headers = {
-            "Title": title,
+            "Title": safe_title,
             "Priority": "high",
             "Tags": "beer,tada,white_check_mark",
         }
         if click_url:
-            headers["Click"] = click_url  # tapping the notification opens this URL
+            headers["Click"] = click_url
         r = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=body.encode("utf-8"),
             headers=headers,
             timeout=10,
         )
-        log(f"[ntfy] Notification sent — HTTP {r.status_code}")
+        log(f"[ntfy] Notification sent -- HTTP {r.status_code}")
     except Exception as e:
         log(f"[ntfy] Failed to send: {e}")
 
@@ -402,9 +404,9 @@ def check_walmart() -> list:
         oos_names = ", ".join(s["name"] for s in oos)
         log(f"  Walmart carries it but OOS at: {oos_names}")
         notify(
-            "Busch Light Apple — Out of Stock at Walmart",
+            "Busch Light Apple - Out of Stock at Walmart",
             f"Product is stocked at {len(oos)} Walmart(s) near you but currently sold out.\n"
-            f"Stores: {oos_names}\n\nKeep checking — it will restock!",
+            f"Stores: {oos_names}\n\nKeep checking - it will restock!",
         )
     return found
 
@@ -452,102 +454,52 @@ def check_bevmo() -> list:
 # Busch Light official "Where to Buy" locator (powered by Locally.com)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _locally_fetch(company_id: str) -> list:
-    """Try all known Locally.com endpoint patterns and return stores list."""
-    api_headers = {
-        "Referer": "https://www.buschlight.com/",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    endpoints = [
-        # Most common Locally.com format
-        (f"https://www.locally.com/stores/map_data"
-         f"?company_id={company_id}&locale={HOME_ZIP}&radius={RADIUS_MILES}&no_variants=0"),
-        # GeoJSON variant
-        (f"https://www.locally.com/stores/geo_json"
-         f"?company_id={company_id}&locale={HOME_ZIP}&radius={RADIUS_MILES}"),
-        # With UPC for Busch Light Apple 12pk (common barcode)
-        (f"https://www.locally.com/stores/map_data"
-         f"?company_id={company_id}&locale={HOME_ZIP}&radius={RADIUS_MILES}"
-         f"&upc=018200013753&no_variants=0"),
-        # Some brands use product_id instead
-        (f"https://www.locally.com/stores/map_data"
-         f"?company_id={company_id}&locale={HOME_ZIP}&radius={RADIUS_MILES}"
-         f"&q={quote_plus(PRODUCT)}&no_variants=0"),
-    ]
-    for url in endpoints:
-        try:
-            r = SESSION.get(url, timeout=12, headers=api_headers)
-            if r.status_code == 200:
-                data = r.json()
-                return data.get("stores", data.get("results", data.get("features", [])))
-            log(f"  Locally endpoint HTTP {r.status_code}: {url.split('?')[0].split('/')[-1]}")
-        except Exception:
-            continue
-    return []
-
-
 def check_buschlight_locator() -> list:
     """
-    Query the Busch Light official store locator.
-    AB InBev embeds a Locally.com widget on buschlight.com; we call it directly.
+    Scrape the Busch Light 'Where to Buy' page for store names near our zip.
+    We look for any store addresses in the page that mention Tucson or 857xx.
     """
     found = []
-    try:
-        # Try to extract company_id from buschlight.com page
-        company_id = "14"
+    urls_to_try = [
+        "https://www.buschlight.com/find-busch-light",
+        "https://www.buschlight.com/where-to-buy",
+        "https://www.buschlight.com/find",
+        "https://www.buschlight.com/store-locator",
+    ]
+    for url in urls_to_try:
         try:
-            r = SESSION.get("https://www.buschlight.com/", timeout=12)
-            for pat in [
-                r'company[_-]?id["\s:=\']+(\d+)',
-                r'locally[^"\']*company_id=(\d+)',
-                r'"companyId"\s*:\s*"?(\d+)',
-                r'data-company-id=["\'](\d+)',
-            ]:
-                m = re.search(pat, r.text, re.I)
-                if m:
-                    company_id = m.group(1)
-                    log(f"  Found Locally company_id: {company_id}")
+            r = SESSION.get(url, timeout=12)
+            if r.status_code == 200:
+                # Look for any embedded JSON with store data
+                json_blobs = re.findall(r'\{[^{}]{50,}\}', r.text)
+                for blob in json_blobs:
+                    if re.search(r'857\d\d|tucson', blob, re.I):
+                        try:
+                            data = json.loads(blob)
+                            name = data.get("name") or data.get("storeName", "")
+                            addr = data.get("address") or data.get("streetAddress", "")
+                            lat  = data.get("lat") or data.get("latitude")
+                            lon  = data.get("lng") or data.get("longitude")
+                            if name and lat and lon:
+                                dist = haversine(HOME_LAT, HOME_LON, float(lat), float(lon))
+                                if dist <= RADIUS_MILES:
+                                    log(f"  *** FOUND at {name} ({dist:.1f} mi) ***")
+                                    found.append({
+                                        "name": name, "address": addr,
+                                        "lat": float(lat), "lon": float(lon),
+                                        "distance": dist, "source": "Busch Light Site",
+                                    })
+                        except Exception:
+                            continue
+                if found:
                     break
-        except Exception:
-            pass
-
-        stores = _locally_fetch(company_id)
-
-        # If default ID fails, try a few known AB InBev IDs
-        if not stores and company_id == "14":
-            for alt_id in ["1", "2", "100", "101", "500"]:
-                stores = _locally_fetch(alt_id)
-                if stores:
-                    log(f"  Working company_id: {alt_id}")
-                    break
-
-        for s in stores:
-            # GeoJSON features have different structure
-            props = s.get("properties", s)
-            lat = props.get("lat") or props.get("latitude") or (s.get("geometry", {}).get("coordinates", [None, None])[1])
-            lon = props.get("lng") or props.get("longitude") or props.get("lon") or (s.get("geometry", {}).get("coordinates", [None, None])[0])
-            if not (lat and lon):
-                continue
-            dist = haversine(HOME_LAT, HOME_LON, float(lat), float(lon))
-            if dist > RADIUS_MILES:
-                continue
-            city  = props.get("city", "")
-            state = props.get("state", "")
-            zipcd = props.get("zip", "")
-            addr  = f"{props.get('address', '')}, {city}, {state} {zipcd}".strip(", ")
-            log(f"  *** FOUND at {props.get('name', 'Store')} ({dist:.1f} mi) ***")
-            found.append({
-                "name": props.get("name", "Unknown Store"),
-                "address": addr,
-                "lat": float(lat), "lon": float(lon),
-                "distance": dist, "source": "Busch Light Locator",
-            })
-
-        if not found:
-            log("  Not found via Busch Light locator")
-    except Exception as e:
-        log(f"  Busch Light locator error: {e}")
+                log(f"  Busch Light site ({url.split('/')[-1]}): no store data found in page")
+                break
+            log(f"  Busch Light site HTTP {r.status_code}: {url.split('/')[-1]}")
+        except Exception as e:
+            log(f"  Busch Light site error: {e}")
+    if not found:
+        log("  Not found via Busch Light site")
     return found
 
 
