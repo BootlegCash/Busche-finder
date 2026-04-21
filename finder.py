@@ -76,17 +76,25 @@ def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
-def notify(title: str, body: str) -> None:
+def maps_link(address: str) -> str:
+    """Return a Google Maps URL for an address."""
+    return f"https://maps.google.com/?q={quote_plus(address)}"
+
+
+def notify(title: str, body: str, click_url: str = "") -> None:
     """Send a push notification via ntfy.sh — completely free, no account needed."""
     try:
+        headers = {
+            "Title": title,
+            "Priority": "high",
+            "Tags": "beer,tada,white_check_mark",
+        }
+        if click_url:
+            headers["Click"] = click_url  # tapping the notification opens this URL
         r = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=body.encode("utf-8"),
-            headers={
-                "Title": title,
-                "Priority": "high",
-                "Tags": "beer,tada,white_check_mark",
-            },
+            headers=headers,
             timeout=10,
         )
         log(f"[ntfy] Notification sent — HTTP {r.status_code}")
@@ -382,65 +390,6 @@ def check_bevmo() -> list:
     return found
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fry's Food (Kroger) scraper
-# ─────────────────────────────────────────────────────────────────────────────
-
-_FRYS_STORES = [
-    {
-        "id": "70200113",
-        "name": "Fry's Food – Speedway/Wilmot",
-        "address": "5765 E Speedway Blvd, Tucson AZ 85712",
-        "lat": 32.2578, "lon": -110.8688,
-    },
-    {
-        "id": "70200114",
-        "name": "Fry's Food – Grant/Craycroft",
-        "address": "4811 E Grant Rd, Tucson AZ 85712",
-        "lat": 32.2526, "lon": -110.8828,
-    },
-    {
-        "id": "70200133",
-        "name": "Fry's Food – Broadway/Craycroft",
-        "address": "6002 E Broadway Blvd, Tucson AZ 85711",
-        "lat": 32.2188, "lon": -110.8665,
-    },
-]
-
-
-def check_frys_store(store: dict) -> bool:
-    """Search Fry's (Kroger) product page for Busch Light Apple."""
-    url = (
-        f"https://www.frysfood.com/search?query={quote_plus(PRODUCT)}"
-        f"&searchType=natural&fulfillment=PICKUP&storeId={store['id']}"
-    )
-    r = SESSION.get(url, timeout=15)
-    if contains_product(r.text) and likely_in_stock(r.text):
-        # Try JSON embedded data
-        nd = parse_nextjs_json(r.text)
-        if nd:
-            page_str = json.dumps(nd)
-            return contains_product(page_str) and likely_in_stock(page_str)
-        return True
-    return False
-
-
-def check_frys() -> list:
-    found = []
-    for s in _FRYS_STORES:
-        dist = haversine(HOME_LAT, HOME_LON, s["lat"], s["lon"])
-        if dist > RADIUS_MILES:
-            continue
-        log(f"  Checking {s['name']} ({dist:.1f} mi)…")
-        try:
-            if check_frys_store(s):
-                log(f"  *** FOUND at {s['name']}! ***")
-                found.append({**s, "distance": dist, "source": "Fry's Food"})
-        except Exception as e:
-            log(f"  Error: {e}")
-        time.sleep(2)
-    return found
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main loop
@@ -459,17 +408,19 @@ def run_check() -> list:
     log("▶ BevMo")
     all_found += check_bevmo()
 
-    log("▶ Fry's Food")
-    all_found += check_frys()
-
     if all_found:
         lines = "\n\n".join(
-            f"• {s['name']}  ({s['distance']:.1f} mi)\n  {s['address']}\n  Source: {s['source']}"
+            f"• {s['name']}  ({s['distance']:.1f} mi)\n"
+            f"  {s['address']}\n"
+            f"  Maps: {maps_link(s['address'])}"
             for s in all_found
         )
+        # If only one store found, tapping the notification opens Maps directly
+        click = maps_link(all_found[0]["address"]) if len(all_found) == 1 else ""
         notify(
             f"Busch Light Apple Found! ({len(all_found)} store{'s' if len(all_found) > 1 else ''})",
             f"Found near 4432 E El Sol Cir, Tucson:\n\n{lines}",
+            click_url=click,
         )
     else:
         log("Not found in any stores this round.")
@@ -490,7 +441,7 @@ def main() -> None:
 ╔══════════════════════════════════════════════════════════╗
 ║            Busch Light Apple Finder                      ║
 ║  Searching: {RADIUS_MILES} miles from 4432 E El Sol Cir, Tucson AZ  ║
-║  Stores:    Total Wine · Walmart · BevMo · Fry's         ║
+║  Stores:    Total Wine · Walmart · BevMo                 ║
 ║  Notify:    https://ntfy.sh/{NTFY_TOPIC:<28}║
 ╚══════════════════════════════════════════════════════════╝
 To receive alerts on your phone:
